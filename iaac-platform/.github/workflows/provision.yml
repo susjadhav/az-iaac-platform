@@ -1,0 +1,206 @@
+# .github/workflows/provision.yml
+#
+# Infrastructure Automation Pipeline
+#
+# Triggered by: workflow_dispatch (from the FastAPI service via GitHub API)
+# Input:        request_json — serialised ProvisioningRequest JSON string
+#
+# The pipeline:
+#   1. Checks out the automation core repo
+#   2. Sets up Python and installs dependencies
+#   3. Configures Azure credentials (Service Principal via OIDC — no secrets stored)
+#   4. Runs the Python dispatcher which handles the full Terraform lifecycle
+#
+# Environment secrets required (set in GitHub repo Settings → Secrets):
+#   AZURE_CLIENT_ID           — Service Principal app (client) ID
+#   AZURE_TENANT_ID           — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID     — Target subscription ID
+#   COSMOS_ENDPOINT           — Cosmos DB account endpoint
+#   AZURE_LOG_STORAGE_ACCOUNT — Storage account name for execution logs
+#   SENDGRID_API_KEY          — SendGrid API key for email notifications
+#   TF_MODULES_ROOT_PATH      — Path to infra-terraform-modules checkout
+
+name: Infrastructure Provisioning
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_json:
+        description: "ProvisioningRequest JSON payload (injected by the API layer)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write   # Required for OIDC authentication to Azure
+  contents: read
+
+jobs:
+  provision:
+    name: "${{ fromJson(inputs.request_json).action }} / ${{ fromJson(inputs.request_json).service_type }}"
+    runs-on: ubuntu-latest
+
+    # Environment protection rules — production requires manual approval
+    environment: ${{ fromJson(inputs.request_json).environment }}
+
+    defaults:
+      run:
+        working-directory: ./infra-automation-core
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Checkout repos
+      # ------------------------------------------------------------------
+
+      - name: Checkout automation core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/infra-automation-core
+          path: infra-automation-core
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Terraform modules
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/infra-terraform-modules
+          path: infra-terraform-modules
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ------------------------------------------------------------------
+      # 2. Toolchain setup
+      # ------------------------------------------------------------------
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: infra-automation-core/pyproject.toml
+
+      - name: Install Python dependencies
+        run: pip install -e ".[runtime]"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: false   # Disable wrapper — we manage subprocess directly
+
+      # ------------------------------------------------------------------
+      # 3. Azure authentication (OIDC — no long-lived credentials)
+      # ------------------------------------------------------------------
+
+      - name: Authenticate to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ------------------------------------------------------------------
+      # 4. Validate request payload
+      # ------------------------------------------------------------------
+
+      - name: Validate request payload
+        env:
+          REQUEST_JSON: ${{ inputs.request_json }}
+        run: |
+          python - <<'EOF'
+          import json, sys, os
+          from automation.models.request import ProvisioningRequest
+          try:
+              req = ProvisioningRequest(**json.loads(os.environ["REQUEST_JSON"]))
+              req.validated_service_config()
+              print(f"✅ Request validated: {req.action.value} {req.service_type.value} for {req.project}/{req.environment.value}")
+          except Exception as e:
+              print(f"❌ Validation failed: {e}", file=sys.stderr)
+              sys.exit(1)
+          EOF
+
+      # ------------------------------------------------------------------
+      # 5. Run the dispatcher
+      # ------------------------------------------------------------------
+
+      - name: Run automation dispatcher
+        env:
+          # Request payload
+          PROVISION_REQUEST_JSON: ${{ inputs.request_json }}
+
+          # Azure ARM credentials (set by azure/login above)
+          ARM_USE_OIDC:           "true"
+          ARM_CLIENT_ID:          ${{ secrets.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:          ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:    ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+          # Platform infrastructure
+          COSMOS_ENDPOINT:           ${{ secrets.COSMOS_ENDPOINT }}
+          COSMOS_DATABASE:           "iaac-platform"
+          AZURE_LOG_STORAGE_ACCOUNT: ${{ secrets.AZURE_LOG_STORAGE_ACCOUNT }}
+          AZURE_LOG_CONTAINER:       "logs"
+          TF_MODULES_ROOT:           ${{ github.workspace }}/infra-terraform-modules
+
+          # Email
+          EMAIL_BACKEND:    "sendgrid"
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          EMAIL_SENDER:     "noreply@iaac-platform.io"
+
+          # GitHub (for self-referential pipeline_run_url injection)
+          GITHUB_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        run: |
+          # Inject pipeline run URL into the request payload
+          REQUEST_WITH_URL=$(python - <<'EOF'
+          import json, os
+          req = json.loads(os.environ["PROVISION_REQUEST_JSON"])
+          req["pipeline_run_url"] = os.environ["GITHUB_RUN_URL"]
+          print(json.dumps(req))
+          EOF
+          )
+          PROVISION_REQUEST_JSON="$REQUEST_WITH_URL" python -m automation.dispatcher
+
+      # ------------------------------------------------------------------
+      # 6. Post-run summary
+      # ------------------------------------------------------------------
+
+      - name: Write job summary
+        if: always()
+        env:
+          REQUEST_JSON: ${{ inputs.request_json }}
+        run: |
+          python - <<'EOF'
+          import json, os
+          req = json.loads(os.environ["REQUEST_JSON"])
+          print(f"## Infrastructure Provisioning Summary")
+          print(f"| Field | Value |")
+          print(f"|-------|-------|")
+          print(f"| Action | `{req.get('action')}` |")
+          print(f"| Service | `{req.get('service_type')}` |")
+          print(f"| Project | `{req.get('project')}` |")
+          print(f"| Environment | `{req.get('environment')}` |")
+          print(f"| Region | `{req.get('region')}` |")
+          print(f"| Request ID | `{req.get('request_id')}` |")
+          print(f"| Owner | {req.get('owner_email')} |")
+          EOF
+        shell: python3 {0}
+
+      - name: Write job summary (shell)
+        if: always()
+        run: |
+          python - <<'PYEOF' >> $GITHUB_STEP_SUMMARY
+          import json, os
+          req = json.loads(os.environ.get("REQUEST_JSON", "{}"))
+          lines = [
+            "## Infrastructure Provisioning Summary\n",
+            "| Field | Value |",
+            "|-------|-------|",
+            f"| Action | `{req.get('action', 'N/A')}` |",
+            f"| Service | `{req.get('service_type', 'N/A')}` |",
+            f"| Project | `{req.get('project', 'N/A')}` |",
+            f"| Environment | `{req.get('environment', 'N/A')}` |",
+            f"| Region | `{req.get('region', 'N/A')}` |",
+            f"| Request ID | `{req.get('request_id', 'N/A')}` |",
+            f"| Owner | {req.get('owner_email', 'N/A')} |",
+          ]
+          print("\n".join(lines))
+          PYEOF
+        env:
+          REQUEST_JSON: ${{ inputs.request_json }}
